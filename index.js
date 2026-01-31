@@ -70,6 +70,7 @@ const defaultSettings = Object.freeze({
     fixedStyleEnabled: false,
     // NEW: Character appearance extraction
     extractAppearance: true, // Extract appearance from character card description
+    extractUserAppearance: true, // Extract appearance from user persona
     // NEW: Clothing detection from chat
     detectClothing: true, // Detect clothing mentions in recent messages
     clothingSearchDepth: 5, // How many messages back to search for clothing
@@ -447,23 +448,105 @@ function extractCharacterAppearance() {
 }
 
 /**
- * Get user persona description
+ * Extract user appearance from persona description
+ * Parses user persona for physical appearance details (same logic as character)
  */
-function getUserPersonaDescription() {
+function extractUserAppearance() {
     try {
         const context = SillyTavern.getContext();
+        const userName = context.name1 || 'User';
         
         // Try to get persona description from power_user
+        let personaDescription = null;
+        
         if (typeof window.power_user !== 'undefined' && window.power_user.persona_description) {
-            const userName = context.name1 || 'User';
-            const personaText = `${userName}'s appearance: ${window.power_user.persona_description}`;
-            iigLog('INFO', `Got user persona: ${personaText.substring(0, 100)}`);
-            return personaText;
+            personaDescription = window.power_user.persona_description;
         }
         
-        return null;
+        if (!personaDescription) {
+            return null;
+        }
+        
+        // Common appearance keywords to look for (same as character extraction)
+        const appearancePatterns = [
+            // Hair
+            /(?:hair|волосы)[:\s]*([^.;,\n]{3,80})/gi,
+            /(?:has|have|with|имеет|с)\s+([a-zA-Zа-яА-Я\s]+(?:hair|волос[ыа]?))/gi,
+            /([a-zA-Zа-яА-Я\-]+(?:\s+[a-zA-Zа-яА-Я\-]+)?)\s+hair/gi,
+            // Eyes  
+            /(?:eyes?|глаза?)[:\s]*([^.;,\n]{3,60})/gi,
+            /([a-zA-Zа-яА-Я\-]+)\s+eyes?/gi,
+            // Skin
+            /(?:skin|кожа)[:\s]*([^.;,\n]{3,60})/gi,
+            /([a-zA-Zа-яА-Я\-]+)\s+skin/gi,
+            // Height/Build
+            /(?:height|рост)[:\s]*([^.;,\n]{3,40})/gi,
+            /(?:tall|short|average|высок|низк|средн)[a-zA-Zа-яА-Я]*/gi,
+            /(?:build|телосложени)[:\s]*([^.;,\n]{3,40})/gi,
+            /(?:muscular|slim|athletic|thin|chubby|мускулист|стройн|худ|полн)[a-zA-Zа-яА-Я]*/gi,
+            // Age appearance
+            /(?:looks?|appears?|выгляд)[a-zA-Zа-яА-Я]*\s+(?:like\s+)?(?:a\s+)?(\d+|young|old|teen|adult|молод|стар|подрост|взросл)/gi,
+            /(\d+)\s*(?:years?\s*old|лет|года?)/gi,
+            // Features
+            /(?:features?|черты)[:\s]*([^.;,\n]{3,80})/gi,
+            // Face
+            /(?:face|лицо)[:\s]*([^.;,\n]{3,60})/gi,
+            // Body parts and features
+            /(?:ears?|уши|ушки)[:\s]*([^.;,\n]{3,40})/gi,
+            /(?:tail|хвост)[:\s]*([^.;,\n]{3,40})/gi,
+            /(?:horns?|рога?)[:\s]*([^.;,\n]{3,40})/gi,
+            /(?:wings?|крыль[яи])[:\s]*([^.;,\n]{3,40})/gi,
+        ];
+        
+        const foundTraits = [];
+        const seenTexts = new Set();
+        
+        for (const pattern of appearancePatterns) {
+            const matches = personaDescription.matchAll(pattern);
+            for (const match of matches) {
+                const trait = (match[1] || match[0]).trim();
+                const lowerTrait = trait.toLowerCase();
+                // Skip duplicates and very short matches
+                if (trait.length > 2 && !seenTexts.has(lowerTrait)) {
+                    seenTexts.add(lowerTrait);
+                    foundTraits.push(trait);
+                }
+            }
+        }
+        
+        // Also try to find structured appearance blocks
+        const appearanceBlockPatterns = [
+            /\[?(?:appearance|внешность|looks?)\]?[:\s]*([^[\]]{10,500})/gi,
+            /\[?(?:physical\s*description|физическое?\s*описание)\]?[:\s]*([^[\]]{10,500})/gi,
+        ];
+        
+        for (const pattern of appearanceBlockPatterns) {
+            const matches = personaDescription.matchAll(pattern);
+            for (const match of matches) {
+                const block = match[1].trim();
+                if (block.length > 10 && !seenTexts.has(block.toLowerCase())) {
+                    seenTexts.add(block.toLowerCase());
+                    foundTraits.push(block);
+                }
+            }
+        }
+        
+        if (foundTraits.length === 0) {
+            // If no specific traits found, use the whole persona as fallback (if short enough)
+            if (personaDescription.length < 500) {
+                iigLog('INFO', `No specific user traits found, using full persona`);
+                return `${userName}'s appearance: ${personaDescription}`;
+            }
+            return null;
+        }
+        
+        // Combine into appearance description
+        const appearanceText = `${userName}'s appearance: ${foundTraits.join(', ')}`;
+        iigLog('INFO', `Extracted user appearance: ${appearanceText.substring(0, 200)}`);
+        
+        return appearanceText;
     } catch (error) {
-        iigLog('ERROR', 'Error getting user persona:', error);
+        iigLog('ERROR', 'Error extracting user appearance:', error);
         return null;
     }
 }
@@ -604,15 +687,18 @@ function buildEnhancedPrompt(basePrompt, style, options = {}) {
             promptParts.push(`[Character Reference: ${charAppearance}]`);
             iigLog('INFO', `✓ Applied character appearance`);
         }
-        
-        const userPersona = getUserPersonaDescription();
-        if (userPersona) {
-            promptParts.push(`[User Reference: ${userPersona}]`);
-            iigLog('INFO', `✓ Applied user persona`);
+    }
+    
+    // 5. User appearance (if enabled - separate setting)
+    if (settings.extractUserAppearance !== false) { // Default true for backwards compatibility
+        const userAppearance = extractUserAppearance();
+        if (userAppearance) {
+            promptParts.push(`[User Reference: ${userAppearance}]`);
+            iigLog('INFO', `✓ Applied user appearance`);
         }
     }
     
-    // 5. Detected clothing (if enabled)
+    // 6. Detected clothing (if enabled)
     if (settings.detectClothing === true) {
         const depth = settings.clothingSearchDepth || 5;
         const clothing = detectClothingFromChat(depth);
@@ -622,10 +708,10 @@ function buildEnhancedPrompt(basePrompt, style, options = {}) {
         }
     }
     
-    // 6. Main prompt (from the tag)
+    // 7. Main prompt (from the tag)
     promptParts.push(basePrompt);
     
-    // 7. Negative prompt (at the end as instruction)
+    // 8. Negative prompt (at the end as instruction)
     if (settings.negativePrompt && settings.negativePrompt.trim() !== '') {
         promptParts.push(`[AVOID: ${settings.negativePrompt.trim()}]`);
         iigLog('INFO', `✓ Applied negative prompt: ${settings.negativePrompt.substring(0, 50)}`);
@@ -1892,11 +1978,16 @@ function createSettingsUI() {
                         <hr>
                         
                         <h5>👤 Извлечение внешности</h5>
-                        <p class="hint">Автоматически извлекать описание внешности из карточки персонажа.</p>
+                        <p class="hint">Автоматически извлекать описание внешности из карточек.</p>
                         
                         <label class="checkbox_label">
                             <input type="checkbox" id="iig_extract_appearance" ${settings.extractAppearance ? 'checked' : ''}>
-                            <span>Извлекать внешность из карточки {{char}}</span>
+                            <span>Извлекать внешность {{char}} из карточки персонажа</span>
+                        </label>
+                        
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="iig_extract_user_appearance" ${settings.extractUserAppearance !== false ? 'checked' : ''}>
+                            <span>Извлекать внешность {{user}} из персоны</span>
                         </label>
                         
                         <hr>
@@ -2181,7 +2272,15 @@ function bindSettingsEvents() {
     document.getElementById('iig_extract_appearance')?.addEventListener('change', (e) => {
         const s = getSettings();
         s.extractAppearance = e.target.checked;
-        iigLog('INFO', `Extract appearance: ${e.target.checked}`);
+        iigLog('INFO', `Extract char appearance: ${e.target.checked}`);
+        saveSettings();
+    });
+    
+    // Extract user appearance toggle
+    document.getElementById('iig_extract_user_appearance')?.addEventListener('change', (e) => {
+        const s = getSettings();
+        s.extractUserAppearance = e.target.checked;
+        iigLog('INFO', `Extract user appearance: ${e.target.checked}`);
         saveSettings();
     });
     
